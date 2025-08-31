@@ -39,6 +39,8 @@ class CreateLobbyRequest(BaseModel):
     name: str
     gameMode: str
     maxPlayers: int = 4
+    host: str  # User ID of the host
+    username: str  # Username of the host
 
 class JoinLobbyRequest(BaseModel):
     userId: str
@@ -433,11 +435,11 @@ async def create_lobby(request: CreateLobbyRequest):
         # Generate unique lobby ID
         lobby_id = f"lobby_{uuid.uuid4().hex[:8]}"
         
-        # Create host player (temporary ID - will be replaced when they connect via WebSocket)
+        # Create host player using the actual user information
         host_player = Player(
-            id=f"user_{uuid.uuid4().hex[:8]}", 
-            username="Host",
-            status="ready",
+            id=request.host,
+            username=request.username,
+            status="ready",  # Host starts ready
             is_host=True
         )
         
@@ -445,15 +447,18 @@ async def create_lobby(request: CreateLobbyRequest):
         lobby = Lobby(
             id=lobby_id,
             name=request.name,
-            host=host_player.id,
+            host=request.host,
             players=[host_player],
             game_mode=request.gameMode,
             max_players=request.maxPlayers
         )
         
+        # Add the host to the player_lobbies mapping
+        game_state.player_lobbies[request.host] = lobby_id
+        
         game_state.add_lobby(lobby)
         
-        logger.info(f"Created lobby {lobby_id}: {request.name}")
+        logger.info(f"Created lobby {lobby_id}: {request.name} (Host: {request.username})")
         return {"success": True, "lobby": lobby_to_dict(lobby)}
         
     except Exception as e:
@@ -479,6 +484,8 @@ async def join_lobby(lobby_id: str, request: JoinLobbyRequest):
         # Check if player is already in the lobby
         if any(p.id == request.userId for p in lobby.players):
             logger.info(f"Player {request.userId} already in lobby {lobby_id}")
+            # Update the player_lobbies mapping in case it's missing
+            game_state.player_lobbies[request.userId] = lobby_id
             return {"success": True, "lobby": lobby_to_dict(lobby)}
             
         # Add player to lobby
