@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 import weakref
+import random
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,8 @@ class Player:
     status: str = "not-ready"  # not-ready, ready
     is_host: bool = False
     score: int = 0
+    countdown_active: bool = False
+    countdown_remaining: int = 0
 
 class CreateLobbyRequest(BaseModel):
     name: str
@@ -48,6 +51,9 @@ class SetReadyRequest(BaseModel):
 class LeaveLobbyRequest(BaseModel):
     userId: str
 
+class StartGameRequest(BaseModel):
+    userId: str
+
 @dataclass
 class Lobby:
     id: str
@@ -56,8 +62,10 @@ class Lobby:
     players: List[Player]
     game_mode: str
     max_players: int
-    status: str = "waiting"  # waiting, in_progress, ended
+    status: str = "waiting"  # waiting, countdown, in_progress, ended
     created: str = None
+    countdown_active: bool = False
+    countdown_task: Optional[asyncio.Task] = None
     
     def __post_init__(self):
         if self.created is None:
@@ -68,6 +76,7 @@ class GameState:
         self.lobbies: Dict[str, Lobby] = {}
         self.connections: Dict[str, WebSocket] = {}  # player_id -> websocket
         self.player_lobbies: Dict[str, str] = {}  # player_id -> lobby_id
+        self.countdown_tasks: Dict[str, asyncio.Task] = {}  # lobby_id -> countdown_task
         
     def add_lobby(self, lobby: Lobby):
         self.lobbies[lobby.id] = lobby
@@ -77,6 +86,10 @@ class GameState:
         
     def remove_lobby(self, lobby_id: str):
         if lobby_id in self.lobbies:
+            # Cancel any active countdown
+            if lobby_id in self.countdown_tasks:
+                self.countdown_tasks[lobby_id].cancel()
+                del self.countdown_tasks[lobby_id]
             del self.lobbies[lobby_id]
             
     def add_player_connection(self, player_id: str, websocket: WebSocket):
@@ -88,6 +101,14 @@ class GameState:
             
     def get_player_connection(self, player_id: str) -> Optional[WebSocket]:
         return self.connections.get(player_id)
+        
+    def set_countdown_task(self, lobby_id: str, task: asyncio.Task):
+        self.countdown_tasks[lobby_id] = task
+        
+    def cancel_countdown_task(self, lobby_id: str):
+        if lobby_id in self.countdown_tasks:
+            self.countdown_tasks[lobby_id].cancel()
+            del self.countdown_tasks[lobby_id]
 
 # Global game state
 game_state = GameState()
@@ -138,7 +159,245 @@ class ConnectionManager:
                 except Exception as e:
                     logger.error(f"Error broadcasting to player {player.id}: {e}")
 
+    async def send_to_player(self, player_id: str, message: dict):
+        """Send message to a specific player"""
+        websocket = game_state.get_player_connection(player_id)
+        if websocket:
+            try:
+                message_str = json.dumps(message)
+                await websocket.send_text(message_str)
+            except Exception as e:
+                logger.error(f"Error sending message to player {player_id}: {e}")
+
 manager = ConnectionManager()
+
+# Countdown functionality
+async def start_countdown_for_unready_players(lobby_id: str):
+    """Start a 15-second countdown for unready players"""
+    lobby = game_state.get_lobby(lobby_id)
+    if not lobby:
+        return
+        
+    # Find unready players
+    unready_players = [p for p in lobby.players if p.status != "ready"]
+    if not unready_players:
+        # All players are ready, start game immediately
+        await start_game_immediately(lobby_id)
+        return
+    
+    # Set countdown for each unready player
+    for player in unready_players:
+        player.countdown_active = True
+        player.countdown_remaining = 15
+    
+    lobby.countdown_active = True
+    lobby.status = "countdown"
+    
+    # Broadcast countdown start
+    await manager.broadcast_to_lobby(lobby_id, {
+        "type": "countdown_started",
+        "unreadyPlayers": [{"id": p.id, "username": p.username} for p in unready_players],
+        "duration": 15
+    })
+    
+    # Start the countdown task
+    task = asyncio.create_task(countdown_timer(lobby_id))
+    game_state.set_countdown_task(lobby_id, task)
+
+async def countdown_timer(lobby_id: str):
+    """Handle the countdown timer logic"""
+    try:
+        for remaining in range(15, 0, -1):
+            await asyncio.sleep(1)
+            
+            lobby = game_state.get_lobby(lobby_id)
+            if not lobby or not lobby.countdown_active:
+                return
+            
+            # Update countdown for unready players
+            unready_players = [p for p in lobby.players if p.status != "ready"]
+            if not unready_players:
+                # All players became ready, start game immediately
+                lobby.countdown_active = False
+                await start_game_immediately(lobby_id)
+                return
+            
+            # Update remaining time for unready players
+            for player in unready_players:
+                player.countdown_remaining = remaining
+            
+            # Broadcast countdown update
+            await manager.broadcast_to_lobby(lobby_id, {
+                "type": "countdown_update",
+                "remaining": remaining,
+                "unreadyPlayers": [{"id": p.id, "username": p.username, "remaining": p.countdown_remaining} for p in unready_players]
+            })
+        
+        # Countdown finished, start game with current players
+        lobby = game_state.get_lobby(lobby_id)
+        if lobby and lobby.countdown_active:
+            lobby.countdown_active = False
+            for player in lobby.players:
+                player.countdown_active = False
+                player.countdown_remaining = 0
+            await start_game_immediately(lobby_id)
+            
+    except asyncio.CancelledError:
+        # Countdown was cancelled (e.g., all players became ready)
+        lobby = game_state.get_lobby(lobby_id)
+        if lobby:
+            lobby.countdown_active = False
+            for player in lobby.players:
+                player.countdown_active = False
+                player.countdown_remaining = 0
+
+async def start_game_immediately(lobby_id: str):
+    """Start the game immediately"""
+    lobby = game_state.get_lobby(lobby_id)
+    if not lobby:
+        return
+        
+    lobby.status = "in_progress"
+    lobby.countdown_active = False
+    
+    # Clean up countdown state
+    game_state.cancel_countdown_task(lobby_id)
+    for player in lobby.players:
+        player.countdown_active = False
+        player.countdown_remaining = 0
+    
+    await manager.broadcast_to_lobby(lobby_id, {
+        "type": "game_started",
+        "gameState": "in_progress"
+    })
+    
+    logger.info(f"Game started in lobby {lobby_id}")
+
+async def assign_new_host(lobby: Lobby):
+    """Randomly assign a new host when the current host leaves"""
+    if not lobby.players:
+        return None
+    
+    # Remove host status from all players first
+    for player in lobby.players:
+        player.is_host = False
+    
+    # Randomly select a new host
+    new_host = random.choice(lobby.players)
+    new_host.is_host = True
+    lobby.host = new_host.id
+    
+    return new_host
+
+async def handle_player_leave(lobby_id: str, leaving_player_id: str):
+    """Handle comprehensive player leave logic"""
+    lobby = game_state.get_lobby(lobby_id)
+    if not lobby:
+        return
+        
+    # Find and remove the leaving player
+    leaving_player = None
+    for i, player in enumerate(lobby.players):
+        if player.id == leaving_player_id:
+            leaving_player = lobby.players.pop(i)
+            break
+    
+    if not leaving_player:
+        return
+        
+    # Remove from player_lobbies mapping
+    if leaving_player_id in game_state.player_lobbies:
+        del game_state.player_lobbies[leaving_player_id]
+    
+    # Remove player connection
+    game_state.remove_player_connection(leaving_player_id)
+    
+    # If lobby is empty, remove it
+    if not lobby.players:
+        game_state.remove_lobby(lobby_id)
+        logger.info(f"Removed empty lobby {lobby_id}")
+        return
+    
+    # If the host left, assign new host
+    new_host = None
+    if leaving_player.is_host:
+        new_host = await assign_new_host(lobby)
+        
+        # Broadcast host change
+        await manager.broadcast_to_lobby(lobby_id, {
+            "type": "host_changed",
+            "newHost": {
+                "id": new_host.id,
+                "username": new_host.username
+            },
+            "players": [asdict(p) for p in lobby.players]
+        })
+    
+    # Check if countdown should be cancelled (if all remaining players are ready)
+    if lobby.countdown_active:
+        unready_players = [p for p in lobby.players if p.status != "ready"]
+        if not unready_players:
+            lobby.countdown_active = False
+            game_state.cancel_countdown_task(lobby_id)
+            await start_game_immediately(lobby_id)
+            return
+    
+    # Broadcast player left message
+    await manager.broadcast_to_lobby(lobby_id, {
+        "type": "player_left",
+        "playerName": leaving_player.username,
+        "playerId": leaving_player.id,
+        "players": [asdict(p) for p in lobby.players],
+        "newHost": new_host.username if new_host else None
+    })
+    
+    logger.info(f"Player {leaving_player.username} left lobby {lobby_id}")
+
+async def handle_player_ready_change(lobby_id: str, player_id: str, new_status: str):
+    """Handle player ready status changes with countdown logic"""
+    lobby = game_state.get_lobby(lobby_id)
+    if not lobby:
+        return False
+        
+    # Find and update player status
+    player_found = False
+    for player in lobby.players:
+        if player.id == player_id:
+            player.status = new_status
+            player_found = True
+            
+            # If player became ready during countdown, update their countdown state
+            if new_status == "ready" and player.countdown_active:
+                player.countdown_active = False
+                player.countdown_remaining = 0
+            break
+    
+    if not player_found:
+        return False
+    
+    # Check if all players are now ready
+    all_ready = all(p.status == "ready" for p in lobby.players)
+    
+    if all_ready and lobby.countdown_active:
+        # Cancel countdown and start game immediately
+        lobby.countdown_active = False
+        game_state.cancel_countdown_task(lobby_id)
+        await start_game_immediately(lobby_id)
+        return True
+    elif all_ready and not lobby.countdown_active and len(lobby.players) > 1:
+        # All players ready without countdown - could auto-start or wait for host
+        pass
+    
+    # Broadcast status update
+    await manager.broadcast_to_lobby(lobby_id, {
+        "type": "player_ready",
+        "playerId": player_id,
+        "status": new_status,
+        "players": [asdict(p) for p in lobby.players],
+        "allReady": all_ready
+    })
+    
+    return True
 
 # Helper functions
 def lobby_to_dict(lobby: Lobby) -> dict:
@@ -151,7 +410,8 @@ def lobby_to_dict(lobby: Lobby) -> dict:
         "gameMode": lobby.game_mode,
         "maxPlayers": lobby.max_players,
         "status": lobby.status,
-        "created": lobby.created
+        "created": lobby.created,
+        "countdownActive": lobby.countdown_active
     }
 
 # API Routes
@@ -212,6 +472,10 @@ async def join_lobby(lobby_id: str, request: JoinLobbyRequest):
         if len(lobby.players) >= lobby.max_players:
             raise HTTPException(status_code=400, detail="Lobby is full")
             
+        # Check if game is already in progress
+        if lobby.status == "in_progress":
+            raise HTTPException(status_code=400, detail="Game is already in progress")
+            
         # Check if player is already in the lobby
         if any(p.id == request.userId for p in lobby.players):
             logger.info(f"Player {request.userId} already in lobby {lobby_id}")
@@ -229,6 +493,7 @@ async def join_lobby(lobby_id: str, request: JoinLobbyRequest):
         # Broadcast player joined message
         await manager.broadcast_to_lobby(lobby_id, {
             "type": "player_joined",
+            "player": asdict(new_player),
             "playerName": request.username,
             "players": [asdict(p) for p in lobby.players],
             "gameState": lobby.status
@@ -251,38 +516,14 @@ async def leave_lobby(lobby_id: str, request: LeaveLobbyRequest):
         if not lobby:
             raise HTTPException(status_code=404, detail="Lobby not found")
             
-        # Find and remove player
-        player_to_remove = None
-        for i, player in enumerate(lobby.players):
-            if player.id == request.userId:
-                player_to_remove = lobby.players.pop(i)
-                break
-                
-        if not player_to_remove:
+        # Check if player is in the lobby
+        player_in_lobby = any(p.id == request.userId for p in lobby.players)
+        if not player_in_lobby:
             raise HTTPException(status_code=404, detail="Player not found in lobby")
-            
-        # Remove from player_lobbies mapping
-        if request.userId in game_state.player_lobbies:
-            del game_state.player_lobbies[request.userId]
-            
-        # If lobby is empty, remove it
-        if not lobby.players:
-            game_state.remove_lobby(lobby_id)
-            logger.info(f"Removed empty lobby {lobby_id}")
-        else:
-            # If the host left, assign new host
-            if player_to_remove.is_host and lobby.players:
-                lobby.players[0].is_host = True
-                lobby.host = lobby.players[0].id
-                
-            # Broadcast player left message
-            await manager.broadcast_to_lobby(lobby_id, {
-                "type": "player_left",
-                "playerName": player_to_remove.username,
-                "players": [asdict(p) for p in lobby.players]
-            })
         
-        logger.info(f"Player {player_to_remove.username} left lobby {lobby_id}")
+        # Handle the leave operation
+        await handle_player_leave(lobby_id, request.userId)
+        
         return {"success": True, "message": "Left lobby successfully"}
         
     except HTTPException:
@@ -299,40 +540,64 @@ async def set_player_ready(lobby_id: str, request: SetReadyRequest):
         if not lobby:
             raise HTTPException(status_code=404, detail="Lobby not found")
             
-        # Find and update player status
-        player_found = False
-        for player in lobby.players:
-            if player.id == request.userId:
-                player.status = request.status
-                player_found = True
-                break
-                
-        if not player_found:
+        # Use the new ready change handler
+        success = await handle_player_ready_change(lobby_id, request.userId, request.status)
+        
+        if not success:
             raise HTTPException(status_code=404, detail="Player not found in lobby")
-            
-        # Broadcast status update
-        await manager.broadcast_to_lobby(lobby_id, {
-            "type": "player_ready",
-            "playerId": request.userId,
-            "status": request.status,
-            "players": [asdict(p) for p in lobby.players]
-        })
         
-        # Check if all players are ready to start game
-        if all(p.status == "ready" for p in lobby.players) and len(lobby.players) > 1:
-            lobby.status = "in_progress"
-            await manager.broadcast_to_lobby(lobby_id, {
-                "type": "game_started",
-                "gameState": "in_progress"
-            })
-        
-        logger.info(f"Player {request.userId} status updated to {request.status} in lobby {lobby_id}")
-        return {"success": True, "lobby": lobby_to_dict(lobby)}
+        # Return updated lobby state
+        updated_lobby = game_state.get_lobby(lobby_id)
+        if updated_lobby:
+            logger.info(f"Player {request.userId} status updated to {request.status} in lobby {lobby_id}")
+            return {"success": True, "lobby": lobby_to_dict(updated_lobby)}
+        else:
+            # Lobby might have been removed if game started
+            return {"success": True, "message": "Status updated"}
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error setting player ready: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/lobbies/{lobby_id}/start")
+async def start_game(lobby_id: str, request: StartGameRequest):
+    """Start the game (host only) - with option for countdown if not all players ready"""
+    try:
+        lobby = game_state.get_lobby(lobby_id)
+        if not lobby:
+            raise HTTPException(status_code=404, detail="Lobby not found")
+            
+        # Check if requester is the host
+        is_host = any(p.id == request.userId and p.is_host for p in lobby.players)
+        if not is_host:
+            raise HTTPException(status_code=403, detail="Only the host can start the game")
+            
+        # Check if game is already in progress
+        if lobby.status in ["countdown", "in_progress"]:
+            raise HTTPException(status_code=400, detail="Game is already started or starting")
+            
+        # Check if there are enough players
+        if len(lobby.players) < 2:
+            raise HTTPException(status_code=400, detail="Need at least 2 players to start")
+        
+        # Check if all players are ready
+        all_ready = all(p.status == "ready" for p in lobby.players)
+        
+        if all_ready:
+            # Start game immediately
+            await start_game_immediately(lobby_id)
+            return {"success": True, "message": "Game started immediately"}
+        else:
+            # Start countdown for unready players
+            await start_countdown_for_unready_players(lobby_id)
+            return {"success": True, "message": "Starting countdown for unready players"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting game: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # WebSocket endpoint
@@ -355,26 +620,64 @@ async def websocket_endpoint(websocket: WebSocket):
                 player_id = message["playerId"]
                 game_state.add_player_connection(player_id, websocket)
                 logger.info(f"WebSocket connected for player {player_id}")
+                
+                # Send current lobby state if player is in a lobby
+                if player_id in game_state.player_lobbies:
+                    current_lobby_id = game_state.player_lobbies[player_id]
+                    current_lobby = game_state.get_lobby(current_lobby_id)
+                    if current_lobby:
+                        await websocket.send_text(json.dumps({
+                            "type": "lobby_state",
+                            "lobby": lobby_to_dict(current_lobby)
+                        }))
                 continue
             
             if action == "joinLobby":
                 lobby = game_state.get_lobby(lobby_id)
                 if lobby:
-                    # This is handled by the HTTP API, WebSocket just confirms connection
+                    # Send confirmation and current lobby state
                     await websocket.send_text(json.dumps({
                         "type": "connected",
-                        "lobbyId": lobby_id
+                        "lobbyId": lobby_id,
+                        "lobby": lobby_to_dict(lobby)
                     }))
                     
-            elif action == "startGame":
+            elif action == "startGame" and player_id:
                 lobby = game_state.get_lobby(lobby_id)
                 if lobby:
-                    lobby.status = "in_progress"
-                    await manager.broadcast_to_lobby(lobby_id, {
-                        "type": "game_started",
-                        "gameState": "in_progress"
-                    })
+                    # Check if player is host
+                    is_host = any(p.id == player_id and p.is_host for p in lobby.players)
+                    if is_host:
+                        # Check if all players are ready
+                        all_ready = all(p.status == "ready" for p in lobby.players)
+                        
+                        if all_ready:
+                            await start_game_immediately(lobby_id)
+                        else:
+                            await start_countdown_for_unready_players(lobby_id)
+                    else:
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Only the host can start the game"
+                        }))
+                        
+            elif action == "toggleReady" and player_id:
+                current_status = message.get("currentStatus", "not-ready")
+                new_status = "not-ready" if current_status == "ready" else "ready"
+                
+                success = await handle_player_ready_change(lobby_id, player_id, new_status)
+                if not success:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Failed to update ready status"
+                    }))
                     
+            elif action == "leaveLobby" and player_id:
+                await handle_player_leave(lobby_id, player_id)
+                await websocket.send_text(json.dumps({
+                    "type": "left_lobby"
+                }))
+                
             elif action == "submitAnswer":
                 answer = message.get("answer", "")
                 await manager.broadcast_to_lobby(lobby_id, {
@@ -392,23 +695,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if player_id:
             game_state.remove_player_connection(player_id)
             
-            # Remove player from their lobby
+            # Handle player disconnection as leaving the lobby
             if player_id in game_state.player_lobbies:
                 lobby_id = game_state.player_lobbies[player_id]
-                lobby = game_state.get_lobby(lobby_id)
-                if lobby:
-                    # Remove player from lobby
-                    lobby.players = [p for p in lobby.players if p.id != player_id]
-                    del game_state.player_lobbies[player_id]
-                    
-                    if not lobby.players:
-                        game_state.remove_lobby(lobby_id)
-                    else:
-                        await manager.broadcast_to_lobby(lobby_id, {
-                            "type": "player_left",
-                            "playerId": player_id,
-                            "players": [asdict(p) for p in lobby.players]
-                        })
+                await handle_player_leave(lobby_id, player_id)
 
 if __name__ == "__main__":
     uvicorn.run(
